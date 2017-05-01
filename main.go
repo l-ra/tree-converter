@@ -32,12 +32,14 @@ type Computation struct {
 	files chan string
 	//pdfInfo        chan PdfInfo
 	PageCount      uint64
+	imageCount     uint64
 	TotalInputSize uint64
 	srcDir         string
 	dstDir         string
 	filePattern    string
 	fileCount      uint64
 	matchedCount   uint64
+	finishedCount  uint64
 	tasks          sync.WaitGroup
 	skipPdfInfo    bool
 	skipPdfConvert bool
@@ -92,6 +94,7 @@ Expectng tree-converter srcDir dstDir
 		dstDir:         os.Args[2],
 		fileCount:      0,
 		matchedCount:   0,
+		finishedCount:  0,
 		skipPdfInfo:    false,
 		skipPdfConvert: true,
 		skipListImages: false,
@@ -99,6 +102,9 @@ Expectng tree-converter srcDir dstDir
 		fileInfos:      make(map[string]*FileInfo),
 		fileInfosLock:  sync.RWMutex{},
 	}
+
+	ticker := time.NewTicker(time.Millisecond * 100)
+	go startNotifier(&context, ticker)
 
 	context.tasks.Add(1)
 	go collectFiles(&context)
@@ -108,9 +114,11 @@ Expectng tree-converter srcDir dstDir
 
 	context.tasks.Wait()
 
+	ticker.Stop()
+
 	end := time.Now()
 
-	fmt.Printf("Total pages: %d took: %f seconds\n", context.PageCount, float64(end.Sub(start))/1000.0/1000.0/1000.0)
+	fmt.Printf("\nTotal pages: %d took: %f seconds\n", context.PageCount, float64(end.Sub(start))/1000.0/1000.0/1000.0)
 
 	doSynced(&context.fileInfosLock, func() {
 		infos := make([]*FileInfo, len(context.fileInfos))
@@ -131,10 +139,15 @@ Expectng tree-converter srcDir dstDir
 			"PageH",
 			"Size",
 			"TextLen",
+			"ScanPdf",
 		})
 
 		for _, val := range context.fileInfos {
 			infos[i] = val
+			scanPdf := "false"
+			if val.PageCount == val.ImageCount && val.TextLen < 500 {
+				scanPdf = "true"
+			}
 			csvWr.Write([]string{
 				val.File,
 				val.DstDir,
@@ -146,6 +159,7 @@ Expectng tree-converter srcDir dstDir
 				strconv.FormatInt(int64(val.PageH), 10),
 				strconv.FormatInt(int64(val.Size), 10),
 				strconv.FormatInt(int64(val.TextLen), 10),
+				scanPdf,
 			})
 			i++
 		}
@@ -153,6 +167,16 @@ Expectng tree-converter srcDir dstDir
 		ioutil.WriteFile(filepath.Join(dstDir, "file-info.json"), json, 0777)
 	})
 
+}
+
+func startNotifier(context *Computation, ticker *time.Ticker) {
+	for range ticker.C {
+		doSynced(&context.fileInfosLock, func() {
+			fmt.Printf("scanned: %5d matched %5d finished %5d page count: %6d image count: %7d total input size: %7d\r",
+				context.fileCount, context.matchedCount, context.finishedCount, context.PageCount, context.imageCount, context.TotalInputSize)
+
+		})
+	}
 }
 
 type SynchronizedTask func()
@@ -264,8 +288,11 @@ func toText(file string, dstFileDir string, context *Computation) {
 
 	doSynced(&context.fileInfosLock, func() {
 		context.fileInfos[file].TextLen = int32(len(text))
+		context.fileInfos[file].ToTextDone = true
+		if fileFinished(context.fileInfos[file]) {
+			context.finishedCount++
+		}
 	})
-
 }
 
 /*
@@ -318,6 +345,9 @@ func createPdfInfo(file string, dstFileDir string, context *Computation) {
 		fileInfo.PageCount = int32(pages)
 		fileInfo.Size = size
 		fileInfo.InfoDone = true
+		if fileFinished(fileInfo) {
+			context.finishedCount++
+		}
 
 		/*
 			return PdfInfo{
@@ -344,7 +374,11 @@ func convertFile(file string, dstFileDir string, context *Computation) {
 	}
 
 	doSynced(&context.fileInfosLock, func() {
-		context.fileInfos[file].ConvDone = true
+		fileInfo := context.fileInfos[file]
+		fileInfo.ConvDone = true
+		if fileFinished(fileInfo) {
+			context.finishedCount++
+		}
 	})
 }
 
@@ -354,10 +388,12 @@ func convertFile(file string, dstFileDir string, context *Computation) {
 func listImages(file string, dstFileDir string, context *Computation) {
 	defer context.tasks.Done()
 
+	commandArray := []string{"pdfimages", "-list", file}
 	listImagesCmd := exec.Command("pdfimages", "-list", file)
 	out, err := listImagesCmd.Output()
 	if err != nil {
 		fmt.Printf("Failed to get image list on file %s: %s\n", file, err.Error())
+		fmt.Printf("Command: %s\n", strings.Join(commandArray, " "))
 	} else {
 		ioutil.WriteFile(filepath.Join(dstFileDir, "image.list"), out, 0777)
 	}
@@ -398,7 +434,19 @@ func listImages(file string, dstFileDir string, context *Computation) {
 			fi.AverageImageW = int32(imageWSum / int64(imageCount))
 			fi.ImageCount = int32(imageCount)
 		}
+		context.imageCount += uint64(imageCount)
+		if fileFinished(fi) {
+			context.finishedCount += 1
+		}
 	})
+}
+
+/*
+======================================================================================
+*/
+func fileFinished(fi *FileInfo) bool {
+	//fmt.Printf("%s %s %s %s\n", fi.ConvDone, fi.ImgsDone, fi.InfoDone, fi.ToTextDone)
+	return fi.ConvDone && fi.ImgsDone && fi.InfoDone && fi.ToTextDone
 }
 
 /*
