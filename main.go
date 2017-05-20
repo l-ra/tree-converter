@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,7 @@ type Computation struct {
 	skipPdfConvert bool
 	skipListImages bool
 	skipToText     bool
+	skipLockFile   bool
 	fileInfos      map[string]*FileInfo
 	fileInfosLock  sync.RWMutex
 }
@@ -67,6 +69,14 @@ type FileInfo struct {
 }
 
 func main() {
+
+	if runtime.GOOS == "windows" {
+		fmt.Printf("windows\n")
+	} else if runtime.GOOS == "linux" {
+		fmt.Printf("linux\n")
+	} else if runtime.GOOS == "darwin" {
+		fmt.Printf("unsupported darwin\n")
+	}
 
 	if len(os.Args) < 3 {
 		fmt.Printf(`Missing argument
@@ -95,22 +105,23 @@ Expectng tree-converter srcDir dstDir
 		fileCount:      0,
 		matchedCount:   0,
 		finishedCount:  0,
-		skipPdfInfo:    false,
+		skipPdfInfo:    true,
 		skipPdfConvert: true,
-		skipListImages: false,
-		skipToText:     false,
+		skipListImages: true,
+		skipToText:     true,
+		skipLockFile:   false,
 		fileInfos:      make(map[string]*FileInfo),
 		fileInfosLock:  sync.RWMutex{},
 	}
 
-	ticker := time.NewTicker(time.Millisecond * 100)
+	ticker := time.NewTicker(time.Millisecond * 500)
 	go startNotifier(&context, ticker)
 
 	context.tasks.Add(1)
 	go collectFiles(&context)
 
 	context.tasks.Add(1)
-	go processFiles(&context)
+	go processFiles(&context, true)
 
 	context.tasks.Wait()
 
@@ -170,10 +181,22 @@ Expectng tree-converter srcDir dstDir
 }
 
 func startNotifier(context *Computation, ticker *time.Ticker) {
+	lastFinished := uint64(0)
+	lastTime := time.Now()
 	for range ticker.C {
 		doSynced(&context.fileInfosLock, func() {
-			fmt.Printf("scanned: %5d matched %5d finished %5d page count: %6d image count: %7d total input size: %7d\r",
-				context.fileCount, context.matchedCount, context.finishedCount, context.PageCount, context.imageCount, context.TotalInputSize)
+			current := time.Now()
+
+			diffSec := current.Sub(lastTime).Seconds()
+			curFinished := context.finishedCount
+			diffFinished := (curFinished - lastFinished)
+			perSec := float64(diffFinished) / diffSec
+
+			lastFinished = curFinished
+			lastTime = current
+
+			fmt.Printf("scanned: %5d matched %5d finished  %5d (%4f/sec) page count: %6d image count: %7d total input size: %7d\r",
+				context.fileCount, context.matchedCount, context.finishedCount, perSec, context.PageCount, context.imageCount, context.TotalInputSize)
 
 		})
 	}
@@ -192,27 +215,44 @@ func check(err error) {
 		fmt.Printf("Error: %s\n", err.Error())
 		panic(err.Error())
 	}
+}
+
+/*
+======================================================================================
+*/
+func processFiles(context *Computation, goroutine bool) {
+	if goroutine {
+		defer context.tasks.Done()
+	}
+
+	for i := 0; i < 5; i++ {
+		context.tasks.Add(1)
+		go fileWorker(context, true)
+	}
 
 }
 
 /*
 ======================================================================================
 */
-func processFiles(context *Computation) {
-	defer context.tasks.Done()
-
+func fileWorker(context *Computation, goroutine bool) {
+	if goroutine {
+		defer context.tasks.Done()
+	}
 	for file := range context.files {
-		context.tasks.Add(1)
-		go processFile(file, context)
+		//context.tasks.Add(1)
+		processFile(file, context, false)
 	}
 }
 
 /*
 ======================================================================================
 */
-func processFile(file string, context *Computation) {
+func processFile(file string, context *Computation, goroutine bool) {
 
-	defer context.tasks.Done()
+	if goroutine {
+		defer context.tasks.Done()
+	}
 
 	rel, _ := filepath.Rel(context.srcDir, file)
 	dstFileDir := filepath.Join(context.dstDir, rel)
@@ -234,23 +274,27 @@ func processFile(file string, context *Computation) {
 	})
 
 	if !context.skipPdfInfo {
-		context.tasks.Add(1)
-		go createPdfInfo(file, dstFileDir, context)
+		//context.tasks.Add(1)
+		createPdfInfo(file, dstFileDir, context, false)
 	}
 
 	if !context.skipPdfConvert {
-		context.tasks.Add(1)
-		go convertFile(file, dstFileDir, context)
+		//context.tasks.Add(1)
+		convertFile(file, dstFileDir, context, false)
 	}
 
 	if !context.skipListImages {
-		context.tasks.Add(1)
-		go listImages(file, dstFileDir, context)
+		//context.tasks.Add(1)
+		listImages(file, dstFileDir, context, false)
 	}
 
 	if !context.skipToText {
-		context.tasks.Add(1)
-		go toText(file, dstFileDir, context)
+		//context.tasks.Add(1)
+		toText(file, dstFileDir, context, false)
+	}
+
+	if !context.skipLockFile {
+		lockFile(file, dstFileDir, context, false)
 	}
 }
 
@@ -269,11 +313,76 @@ func match2map(re *regexp.Regexp, s string) map[string]string {
 	return fields
 }
 
+func ensureInfoFile(context *Computation) (string, error) {
+	infoFile := filepath.Join(context.dstDir, "info.txt")
+
+	_, statErr := os.Stat(infoFile)
+	if statErr == nil {
+		return infoFile, nil
+	}
+
+	infoFileContents := fmt.Sprintf(`InfoBegin
+InfoKey: Keywords
+InfoValue: %s
+`, filepath.Base(context.dstDir))
+
+	writeErr := ioutil.WriteFile(infoFile, []byte(infoFileContents), 0644)
+	if writeErr == nil {
+		return infoFile, nil
+	} else {
+		return "", writeErr
+	}
+}
+
 /*
 ======================================================================================
 */
-func toText(file string, dstFileDir string, context *Computation) {
-	defer context.tasks.Done()
+func lockFile(file string, dstFileDir string, context *Computation, goroutine bool) {
+	if goroutine {
+		defer context.tasks.Done()
+	}
+
+	//docker run -it --rm -v $(realpath .):/work -v $(realpath ./out):/out mnuessler/pdftk /work/zdenka-kalendar.pdf  update_info info.dat  output /out/xxx.pdf encrypt_128bit owner_pw owner user_pw user
+	infoFile, infoFileErr := ensureInfoFile(context)
+	if infoFileErr != nil {
+		fmt.Printf("failed to create info.txt in %s: %s\n", context.dstDir, infoFileErr.Error())
+		return
+	}
+
+	inDir := filepath.Dir(file)
+	inFile := filepath.Base(file)
+	outDir := filepath.Dir(dstFileDir)
+	outFile := filepath.Base(dstFileDir)
+
+	lockCmd := exec.Command("docker", "run", "-it", "--rm",
+		"-v", inDir+":/work", "-v", outDir+"/out",
+		"mnuessler/pdftk",
+		"/work/"+inFile, "update_info", infoFile, "output", "/out/"+outFile,
+		"encrypt_128bit", "owner_pw", "owner", "user_pw", "user")
+	///convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
+	out, err := lockCmd.Output()
+	if err != nil {
+		fmt.Printf("Failed to get info on file %s: %s\n", file, err.Error())
+	} else {
+		ioutil.WriteFile(filepath.Join(dstFileDir, "convert.txt"), out, 0777)
+	}
+
+	doSynced(&context.fileInfosLock, func() {
+		fileInfo := context.fileInfos[file]
+		fileInfo.ConvDone = true
+		if fileFinished(fileInfo) {
+			context.finishedCount++
+		}
+	})
+}
+
+/*
+======================================================================================
+*/
+func toText(file string, dstFileDir string, context *Computation, goroutine bool) {
+	if goroutine {
+		defer context.tasks.Done()
+	}
 
 	toTextCmd := exec.Command("pdftotext", file, "-")
 	textBytes, err := toTextCmd.Output()
@@ -298,8 +407,10 @@ func toText(file string, dstFileDir string, context *Computation) {
 /*
 ======================================================================================
 */
-func createPdfInfo(file string, dstFileDir string, context *Computation) {
-	defer context.tasks.Done()
+func createPdfInfo(file string, dstFileDir string, context *Computation, goroutine bool) {
+	if goroutine {
+		defer context.tasks.Done()
+	}
 
 	convertCmd := exec.Command("pdfinfo", file)
 	pdfinfo, err := convertCmd.Output()
@@ -362,8 +473,10 @@ func createPdfInfo(file string, dstFileDir string, context *Computation) {
 /*
 ======================================================================================
 */
-func convertFile(file string, dstFileDir string, context *Computation) {
-	defer context.tasks.Done()
+func convertFile(file string, dstFileDir string, context *Computation, goroutine bool) {
+	if goroutine {
+		defer context.tasks.Done()
+	}
 
 	convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
 	out, err := convertCmd.Output()
@@ -385,8 +498,10 @@ func convertFile(file string, dstFileDir string, context *Computation) {
 /*
 ======================================================================================
 */
-func listImages(file string, dstFileDir string, context *Computation) {
-	defer context.tasks.Done()
+func listImages(file string, dstFileDir string, context *Computation, goroutine bool) {
+	if goroutine {
+		defer context.tasks.Done()
+	}
 
 	commandArray := []string{"pdfimages", "-list", file}
 	listImagesCmd := exec.Command("pdfimages", "-list", file)
