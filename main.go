@@ -17,6 +17,10 @@ import (
 	"time"
 )
 
+func workerCount() int {
+	return 20
+}
+
 /*
 ======================================================================================
 */
@@ -37,6 +41,8 @@ type Computation struct {
 	TotalInputSize uint64
 	srcDir         string
 	dstDir         string
+	userPasswd     string
+	deleteOutput   bool
 	filePattern    string
 	fileCount      uint64
 	matchedCount   uint64
@@ -67,6 +73,11 @@ type FileInfo struct {
 	ImgsDone      bool
 	ToTextDone    bool
 	LockDone      bool
+	InfoErr       bool
+	ConvErr       bool
+	ImgsErr       bool
+	ToTextErr     bool
+	LockErr       bool
 }
 
 func main() {
@@ -79,9 +90,9 @@ func main() {
 		fmt.Printf("unsupported darwin\n")
 	}
 
-	if len(os.Args) < 3 {
+	if len(os.Args) < 5 {
 		fmt.Printf(`Missing argument
-Expectng tree-converter srcDir dstDir
+Expectng tree-converter srcDir dstDir password delout|nodelout
 `)
 		return
 	}
@@ -103,6 +114,8 @@ Expectng tree-converter srcDir dstDir
 		TotalInputSize: 0,
 		srcDir:         os.Args[1],
 		dstDir:         os.Args[2],
+		userPasswd:     os.Args[3],
+		deleteOutput:   os.Args[4] == "delout",
 		fileCount:      0,
 		matchedCount:   0,
 		finishedCount:  0,
@@ -152,6 +165,11 @@ Expectng tree-converter srcDir dstDir
 			"Size",
 			"TextLen",
 			"ScanPdf",
+			"InfoDone",
+			"ImgsDone",
+			"ConvDone",
+			"ToTextDone",
+			"LockDone",
 		})
 
 		for _, val := range context.fileInfos {
@@ -172,6 +190,11 @@ Expectng tree-converter srcDir dstDir
 				strconv.FormatInt(int64(val.Size), 10),
 				strconv.FormatInt(int64(val.TextLen), 10),
 				scanPdf,
+				strconv.FormatBool(val.InfoErr),
+				strconv.FormatBool(val.ImgsErr),
+				strconv.FormatBool(val.ConvErr),
+				strconv.FormatBool(val.ToTextErr),
+				strconv.FormatBool(val.LockErr),
 			})
 			i++
 		}
@@ -226,7 +249,7 @@ func processFiles(context *Computation, goroutine bool) {
 		defer context.tasks.Done()
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < workerCount(); i++ {
 		context.tasks.Add(1)
 		go fileWorker(context, true)
 	}
@@ -275,6 +298,11 @@ func processFile(file string, context *Computation, goroutine bool) {
 		ConvDone:   context.skipPdfConvert,
 		LockDone:   context.skipLockFile,
 		ToTextDone: context.skipToText,
+		InfoErr:    false,
+		ConvErr:    false,
+		ImgsErr:    false,
+		ToTextErr:  false,
+		LockErr:    false,
 	}
 
 	doSynced(&context.fileInfosLock, func() {
@@ -346,50 +374,58 @@ InfoValue: ID-%s
 ======================================================================================
 */
 func lockFile(file string, dstFileDir string, context *Computation, goroutine bool) {
+	fileInfo := context.fileInfos[file]
+
 	if goroutine {
 		defer context.tasks.Done()
 	}
 
-	tmpFile, tmpErr := ioutil.TempFile("", "xxxx")
-	if tmpErr != nil {
-		fmt.Printf("Error creating temp file %s\n", tmpErr.Error())
+	/*
+		tmpFile, tmpErr := ioutil.TempFile("", "xxxx")
+		if tmpErr != nil {
+			fmt.Printf("Error creating temp file %s\n", tmpErr.Error())
+			return
+		}
+		tmpFileName, _ := filepath.Abs(tmpFile.Name()) //FIXME not ignore error
+		tmpFile.Close()
+		tmpFileNamePdf := tmpFileName + ".pdf" //FIXME not ignore error
+
+		defer os.Remove(tmpFileNamePdf)
+		defer os.Remove(tmpFileName)
+
+		cmdAddKw := "exiftool"
+		cmdAddKwArgs := []string{fmt.Sprintf("-Keywords+=ID-%s", filepath.Base(context.dstDir)),
+			"-o", tmpFileNamePdf,
+			file}
+
+		addKeywordsCmd := exec.Command(cmdAddKw, cmdAddKwArgs...)
+
+		outKw, outKwErr := addKeywordsCmd.CombinedOutput()
+		if outKwErr != nil {
+			fmt.Printf("Error while adding kw %s\nOut:%s\nCmd:exiftool %s\n", outKwErr.Error(), outKw, cmdAddKwArgs)
+			return
+		}
+	*/
+
+	infoFile, infoFileErr := ensureInfoFile(context)
+	if infoFileErr != nil {
+		fmt.Printf("failed to create info.txt in %s: %s\n", context.dstDir, infoFileErr.Error())
 		return
 	}
-	tmpFileName, _ := filepath.Abs(tmpFile.Name()) //FIXME not ignore error
-	tmpFile.Close()
-	tmpFileNamePdf := tmpFileName + ".pdf" //FIXME not ignore error
-
-	defer os.Remove(tmpFileNamePdf)
-	defer os.Remove(tmpFileName)
-
-	cmdAddKw := "exiftool"
-	cmdAddKwArgs := []string{fmt.Sprintf("-Keywords+=ID-%s", filepath.Base(context.dstDir)),
-		"-o", tmpFileNamePdf,
-		file}
-
-	addKeywordsCmd := exec.Command(cmdAddKw, cmdAddKwArgs...)
-
-	outKw, outKwErr := addKeywordsCmd.CombinedOutput()
-	if outKwErr != nil {
-		fmt.Printf("Error while adding kw %s\nOut:%s\nCmd:exiftool %s\n", outKwErr.Error(), outKw, cmdAddKwArgs)
-		return
-	}
-
-	//infoFile, infoFileErr := ensureInfoFile(context)
-	//if infoFileErr != nil {
-	//	fmt.Printf("failed to create info.txt in %s: %s\n", context.dstDir, infoFileErr.Error())
-	//	return
-	//}
 
 	//fmt.Printf("locking %s <<\n", dstFileDir)
 
 	if runtime.GOOS == "linux" {
 		dstDir, dstErr := filepath.Abs(context.dstDir)
-		//infoFileFile := filepath.Base(infoFile)
-		inDir, inErr := filepath.Abs(filepath.Dir(tmpFileNamePdf))
-		inFile := filepath.Base(tmpFileNamePdf)
+		infoFileFile := filepath.Base(infoFile)
+		inDir, inErr := filepath.Abs(filepath.Dir(file))
+		inFile := filepath.Base(file)
 		outDir, outErr := filepath.Abs(filepath.Dir(dstFileDir))
 		outFile := filepath.Base(file)
+		outFileAbs, _ := filepath.Abs(filepath.Join(outDir, outFile))
+		if context.deleteOutput {
+			defer os.Remove(outFileAbs)
+		}
 
 		if inErr != nil {
 			fmt.Printf("failed to abs of in dir %s", inErr.Error())
@@ -406,13 +442,13 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 			return
 		}
 
-		//"update_info", "/dst/" + infoFileFile,
+		//
 		cmd := "docker"
 		cmdArgs := []string{"run", "--rm",
 			"-v", inDir + ":/work", "-v", outDir + ":/out", "-v", dstDir + ":/dst",
 			"-u", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 			"mnuessler/pdftk",
-			"/work/" + inFile, "output", "/out/" + outFile,
+			"/work/" + inFile, "update_info", "/dst/" + infoFileFile, "output", "/out/" + outFile,
 			"encrypt_128bit", "owner_pw", "owner", "user_pw", "user"}
 
 		lockCmd := exec.Command(cmd, cmdArgs...)
@@ -421,6 +457,7 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		out, err := lockCmd.CombinedOutput()
 		if err != nil {
 			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
+			fileInfo.LockErr = true
 		}
 		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
 	}
@@ -429,10 +466,14 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		base := filepath.Base(file)
 		dir := filepath.Dir(dstFileDir)
 		outFile := filepath.Join(dir, base)
+		outFileAbs, _ := filepath.Abs(filepath.Join(dir, base))
+		if context.deleteOutput {
+			defer os.Remove(outFileAbs)
+		}
 
-		//"update_info", infoFile,
+		//
 		cmd := "pdftk"
-		cmdArgs := []string{tmpFileNamePdf, "output", outFile,
+		cmdArgs := []string{file, "update_info", infoFile, "output", outFile,
 			"encrypt_128bit", "owner_pw", "owner", "user_pw", "user"}
 
 		lockCmd := exec.Command(cmd, cmdArgs...)
@@ -441,13 +482,12 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		out, err := lockCmd.Output()
 		if err != nil {
 			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
-		} else {
-			ioutil.WriteFile(filepath.Join(dstFileDir, "convert.txt"), out, 0777)
+			fileInfo.LockErr = true
 		}
+		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
 	}
 
 	doSynced(&context.fileInfosLock, func() {
-		fileInfo := context.fileInfos[file]
 		fileInfo.LockDone = true
 		if fileFinished(fileInfo) {
 			context.finishedCount++
@@ -468,6 +508,7 @@ func toText(file string, dstFileDir string, context *Computation, goroutine bool
 
 	if err != nil {
 		fmt.Printf("Failed to get text from file %s: %s\n", file, err.Error())
+		context.fileInfos[file].ToTextErr = true
 		return
 	}
 
@@ -496,6 +537,7 @@ func createPdfInfo(file string, dstFileDir string, context *Computation, gorouti
 
 	if err != nil {
 		fmt.Printf("Failed to get info on file %s: %s\n", file, err.Error())
+		context.fileInfos[file].InfoErr = true
 	} else {
 		ioutil.WriteFile(filepath.Join(dstFileDir, "pdfinfo.txt"), pdfinfo, 0777)
 
@@ -561,6 +603,7 @@ func convertFile(file string, dstFileDir string, context *Computation, goroutine
 	out, err := convertCmd.Output()
 	if err != nil {
 		fmt.Printf("Failed to get info on file %s: %s\n", file, err.Error())
+		context.fileInfos[file].ImgsErr = true
 	} else {
 		ioutil.WriteFile(filepath.Join(dstFileDir, "convert.txt"), out, 0777)
 	}
