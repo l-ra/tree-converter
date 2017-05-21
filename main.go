@@ -66,6 +66,7 @@ type FileInfo struct {
 	ConvDone      bool
 	ImgsDone      bool
 	ToTextDone    bool
+	LockDone      bool
 }
 
 func main() {
@@ -105,7 +106,7 @@ Expectng tree-converter srcDir dstDir
 		fileCount:      0,
 		matchedCount:   0,
 		finishedCount:  0,
-		skipPdfInfo:    true,
+		skipPdfInfo:    false,
 		skipPdfConvert: true,
 		skipListImages: true,
 		skipToText:     true,
@@ -245,6 +246,18 @@ func fileWorker(context *Computation, goroutine bool) {
 	}
 }
 
+func mkOutDir(file string, context *Computation, mkdir bool) string {
+	rel, _ := filepath.Rel(context.srcDir, file)
+	dstFileDir := filepath.Join(context.dstDir, rel+"-out")
+	if mkdir {
+		if err := os.MkdirAll(dstFileDir, 0774); err != nil {
+			fmt.Printf("failed to create file dst dir: %s erroe: %s\n", dstFileDir, err.Error())
+			return ""
+		}
+	}
+	return dstFileDir
+}
+
 /*
 ======================================================================================
 */
@@ -254,19 +267,14 @@ func processFile(file string, context *Computation, goroutine bool) {
 		defer context.tasks.Done()
 	}
 
-	rel, _ := filepath.Rel(context.srcDir, file)
-	dstFileDir := filepath.Join(context.dstDir, rel)
-	if err := os.MkdirAll(dstFileDir, 0777); err != nil {
-		fmt.Printf("failed to create file dst dir: %s\n", dstFileDir)
-		return
-	}
-
 	fi := FileInfo{
-		File:     file,
-		DstDir:   dstFileDir,
-		ImgsDone: context.skipListImages,
-		InfoDone: context.skipPdfInfo,
-		ConvDone: context.skipPdfConvert,
+		File:       file,
+		DstDir:     mkOutDir(file, context, true),
+		ImgsDone:   context.skipListImages,
+		InfoDone:   context.skipPdfInfo,
+		ConvDone:   context.skipPdfConvert,
+		LockDone:   context.skipLockFile,
+		ToTextDone: context.skipToText,
 	}
 
 	doSynced(&context.fileInfosLock, func() {
@@ -275,26 +283,26 @@ func processFile(file string, context *Computation, goroutine bool) {
 
 	if !context.skipPdfInfo {
 		//context.tasks.Add(1)
-		createPdfInfo(file, dstFileDir, context, false)
+		createPdfInfo(file, fi.DstDir, context, false)
 	}
 
 	if !context.skipPdfConvert {
 		//context.tasks.Add(1)
-		convertFile(file, dstFileDir, context, false)
+		convertFile(file, fi.DstDir, context, false)
 	}
 
 	if !context.skipListImages {
 		//context.tasks.Add(1)
-		listImages(file, dstFileDir, context, false)
+		listImages(file, fi.DstDir, context, false)
 	}
 
 	if !context.skipToText {
 		//context.tasks.Add(1)
-		toText(file, dstFileDir, context, false)
+		toText(file, fi.DstDir, context, false)
 	}
 
 	if !context.skipLockFile {
-		lockFile(file, dstFileDir, context, false)
+		lockFile(file, fi.DstDir, context, false)
 	}
 }
 
@@ -323,7 +331,7 @@ func ensureInfoFile(context *Computation) (string, error) {
 
 	infoFileContents := fmt.Sprintf(`InfoBegin
 InfoKey: Keywords
-InfoValue: %s
+InfoValue: ID-%s
 `, filepath.Base(context.dstDir))
 
 	writeErr := ioutil.WriteFile(infoFile, []byte(infoFileContents), 0644)
@@ -342,34 +350,105 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		defer context.tasks.Done()
 	}
 
-	//docker run -it --rm -v $(realpath .):/work -v $(realpath ./out):/out mnuessler/pdftk /work/zdenka-kalendar.pdf  update_info info.dat  output /out/xxx.pdf encrypt_128bit owner_pw owner user_pw user
-	infoFile, infoFileErr := ensureInfoFile(context)
-	if infoFileErr != nil {
-		fmt.Printf("failed to create info.txt in %s: %s\n", context.dstDir, infoFileErr.Error())
+	tmpFile, tmpErr := ioutil.TempFile("", "xxxx")
+	if tmpErr != nil {
+		fmt.Printf("Error creating temp file %s\n", tmpErr.Error())
+		return
+	}
+	tmpFileName, _ := filepath.Abs(tmpFile.Name()) //FIXME not ignore error
+	tmpFile.Close()
+	tmpFileNamePdf := tmpFileName + ".pdf" //FIXME not ignore error
+
+	defer os.Remove(tmpFileNamePdf)
+	defer os.Remove(tmpFileName)
+
+	cmdAddKw := "exiftool"
+	cmdAddKwArgs := []string{fmt.Sprintf("-Keywords+=ID-%s", filepath.Base(context.dstDir)),
+		"-o", tmpFileNamePdf,
+		file}
+
+	addKeywordsCmd := exec.Command(cmdAddKw, cmdAddKwArgs...)
+
+	outKw, outKwErr := addKeywordsCmd.CombinedOutput()
+	if outKwErr != nil {
+		fmt.Printf("Error while adding kw %s\nOut:%s\nCmd:exiftool %s\n", outKwErr.Error(), outKw, cmdAddKwArgs)
 		return
 	}
 
-	inDir := filepath.Dir(file)
-	inFile := filepath.Base(file)
-	outDir := filepath.Dir(dstFileDir)
-	outFile := filepath.Base(dstFileDir)
+	//infoFile, infoFileErr := ensureInfoFile(context)
+	//if infoFileErr != nil {
+	//	fmt.Printf("failed to create info.txt in %s: %s\n", context.dstDir, infoFileErr.Error())
+	//	return
+	//}
 
-	lockCmd := exec.Command("docker", "run", "-it", "--rm",
-		"-v", inDir+":/work", "-v", outDir+"/out",
-		"mnuessler/pdftk",
-		"/work/"+inFile, "update_info", infoFile, "output", "/out/"+outFile,
-		"encrypt_128bit", "owner_pw", "owner", "user_pw", "user")
-	///convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
-	out, err := lockCmd.Output()
-	if err != nil {
-		fmt.Printf("Failed to get info on file %s: %s\n", file, err.Error())
-	} else {
-		ioutil.WriteFile(filepath.Join(dstFileDir, "convert.txt"), out, 0777)
+	//fmt.Printf("locking %s <<\n", dstFileDir)
+
+	if runtime.GOOS == "linux" {
+		dstDir, dstErr := filepath.Abs(context.dstDir)
+		//infoFileFile := filepath.Base(infoFile)
+		inDir, inErr := filepath.Abs(filepath.Dir(tmpFileNamePdf))
+		inFile := filepath.Base(tmpFileNamePdf)
+		outDir, outErr := filepath.Abs(filepath.Dir(dstFileDir))
+		outFile := filepath.Base(file)
+
+		if inErr != nil {
+			fmt.Printf("failed to abs of in dir %s", inErr.Error())
+			return
+		}
+
+		if outErr != nil {
+			fmt.Printf("failed to abs of out dir %s", outErr.Error())
+			return
+		}
+
+		if dstErr != nil {
+			fmt.Printf("failed to abs of out dir %s", dstErr.Error())
+			return
+		}
+
+		//"update_info", "/dst/" + infoFileFile,
+		cmd := "docker"
+		cmdArgs := []string{"run", "--rm",
+			"-v", inDir + ":/work", "-v", outDir + ":/out", "-v", dstDir + ":/dst",
+			"-u", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+			"mnuessler/pdftk",
+			"/work/" + inFile, "output", "/out/" + outFile,
+			"encrypt_128bit", "owner_pw", "owner", "user_pw", "user"}
+
+		lockCmd := exec.Command(cmd, cmdArgs...)
+
+		///convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
+		out, err := lockCmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
+		}
+		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
+	}
+
+	if runtime.GOOS == "windows" {
+		base := filepath.Base(file)
+		dir := filepath.Dir(dstFileDir)
+		outFile := filepath.Join(dir, base)
+
+		//"update_info", infoFile,
+		cmd := "pdftk"
+		cmdArgs := []string{tmpFileNamePdf, "output", outFile,
+			"encrypt_128bit", "owner_pw", "owner", "user_pw", "user"}
+
+		lockCmd := exec.Command(cmd, cmdArgs...)
+
+		///convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
+		out, err := lockCmd.Output()
+		if err != nil {
+			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
+		} else {
+			ioutil.WriteFile(filepath.Join(dstFileDir, "convert.txt"), out, 0777)
+		}
 	}
 
 	doSynced(&context.fileInfosLock, func() {
 		fileInfo := context.fileInfos[file]
-		fileInfo.ConvDone = true
+		fileInfo.LockDone = true
 		if fileFinished(fileInfo) {
 			context.finishedCount++
 		}
@@ -561,7 +640,7 @@ func listImages(file string, dstFileDir string, context *Computation, goroutine 
 */
 func fileFinished(fi *FileInfo) bool {
 	//fmt.Printf("%s %s %s %s\n", fi.ConvDone, fi.ImgsDone, fi.InfoDone, fi.ToTextDone)
-	return fi.ConvDone && fi.ImgsDone && fi.InfoDone && fi.ToTextDone
+	return fi.ConvDone && fi.ImgsDone && fi.InfoDone && fi.ToTextDone && fi.LockDone
 }
 
 /*
