@@ -415,7 +415,7 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 
 	//fmt.Printf("locking %s <<\n", dstFileDir)
 
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && false {
 		dstDir, dstErr := filepath.Abs(context.dstDir)
 		infoFileFile := filepath.Base(infoFile)
 		inDir, inErr := filepath.Abs(filepath.Dir(file))
@@ -462,7 +462,7 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
 	}
 
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" || true {
 		base := filepath.Base(file)
 		dir := filepath.Dir(dstFileDir)
 		outFile := filepath.Join(dir, base)
