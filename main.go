@@ -374,8 +374,7 @@ InfoValue: ID-%s
 ======================================================================================
 */
 func lockFile(file string, dstFileDir string, context *Computation, goroutine bool) {
-	fileInfo := context.fileInfos[file]
-
+	err := false
 	if goroutine {
 		defer context.tasks.Done()
 	}
@@ -457,7 +456,7 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		out, err := lockCmd.CombinedOutput()
 		if err != nil {
 			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
-			fileInfo.LockErr = true
+			err = true
 		}
 		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
 	}
@@ -482,13 +481,18 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		out, err := lockCmd.Output()
 		if err != nil {
 			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
-			fileInfo.LockErr = true
+			err = true
 		}
 		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
 	}
 
 	doSynced(&context.fileInfosLock, func() {
+		fileInfo := context.fileInfos[file]
 		fileInfo.LockDone = true
+		if err {
+			fileInfo.LockErr = true
+		}
+
 		if fileFinished(fileInfo) {
 			context.finishedCount++
 		}
@@ -571,15 +575,15 @@ func createPdfInfo(file string, dstFileDir string, context *Computation, gorouti
 		var fileInfo *FileInfo
 		doSynced(&context.fileInfosLock, func() {
 			fileInfo = context.fileInfos[file]
+			fileInfo.PageW = int32(pageW)
+			fileInfo.PageH = int32(pageH)
+			fileInfo.PageCount = int32(pages)
+			fileInfo.Size = size
+			fileInfo.InfoDone = true
+			if fileFinished(fileInfo) {
+				context.finishedCount++
+			}
 		})
-		fileInfo.PageW = int32(pageW)
-		fileInfo.PageH = int32(pageH)
-		fileInfo.PageCount = int32(pages)
-		fileInfo.Size = size
-		fileInfo.InfoDone = true
-		if fileFinished(fileInfo) {
-			context.finishedCount++
-		}
 
 		/*
 			return PdfInfo{
@@ -595,6 +599,7 @@ func createPdfInfo(file string, dstFileDir string, context *Computation, gorouti
 ======================================================================================
 */
 func convertFile(file string, dstFileDir string, context *Computation, goroutine bool) {
+	err := false
 	if goroutine {
 		defer context.tasks.Done()
 	}
@@ -603,7 +608,7 @@ func convertFile(file string, dstFileDir string, context *Computation, goroutine
 	out, err := convertCmd.Output()
 	if err != nil {
 		fmt.Printf("Failed to get info on file %s: %s\n", file, err.Error())
-		context.fileInfos[file].ImgsErr = true
+		err = true
 	} else {
 		ioutil.WriteFile(filepath.Join(dstFileDir, "convert.txt"), out, 0777)
 	}
@@ -611,6 +616,9 @@ func convertFile(file string, dstFileDir string, context *Computation, goroutine
 	doSynced(&context.fileInfosLock, func() {
 		fileInfo := context.fileInfos[file]
 		fileInfo.ConvDone = true
+		if err {
+			context.fileInfos[file].ImgsErr = true
+		}
 		if fileFinished(fileInfo) {
 			context.finishedCount++
 		}
