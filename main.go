@@ -453,9 +453,9 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		lockCmd := exec.Command(cmd, cmdArgs...)
 
 		///convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
-		out, err := lockCmd.CombinedOutput()
-		if err != nil {
-			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
+		out, errCnv := lockCmd.CombinedOutput()
+		if errCnv != nil {
+			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, errCnv.Error(), cmd, cmdArgs)
 			err = true
 		}
 		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
@@ -478,9 +478,9 @@ func lockFile(file string, dstFileDir string, context *Computation, goroutine bo
 		lockCmd := exec.Command(cmd, cmdArgs...)
 
 		///convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
-		out, err := lockCmd.Output()
-		if err != nil {
-			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, err.Error(), cmd, cmdArgs)
+		out, errLck := lockCmd.Output()
+		if errLck != nil {
+			fmt.Printf("Failed to lock file %s: %s\nCommand:\n%s\n", file, errLck.Error(), cmd, cmdArgs)
 			err = true
 		}
 		ioutil.WriteFile(filepath.Join(dstFileDir, "lock.txt"), out, 0777)
@@ -605,9 +605,9 @@ func convertFile(file string, dstFileDir string, context *Computation, goroutine
 	}
 
 	convertCmd := exec.Command("pdftopng", "-r", "300", file, filepath.Join(dstFileDir, "pages"))
-	out, err := convertCmd.Output()
-	if err != nil {
-		fmt.Printf("Failed to get info on file %s: %s\n", file, err.Error())
+	out, errCnv := convertCmd.Output()
+	if errCnv != nil {
+		fmt.Printf("Failed to get info on file %s: %s\n", file, errCnv.Error())
 		err = true
 	} else {
 		ioutil.WriteFile(filepath.Join(dstFileDir, "convert.txt"), out, 0777)
